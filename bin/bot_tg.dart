@@ -95,9 +95,15 @@ Future<void> handleMessage(Database db, int chatId, String username, String text
   registerUserIfNeeded(db, chatId, username);
 
   if (text == '/start') {
-    await sendMessage(chatId, 'Привет! Я бот "Назарей". Отмечайся сообщениями "прочитал" или "молился", ' +
-        'и я сохраню это. Чтобы получать утренние напоминания в 6:00, используй /subscribe. ' +
-        'Чтобы отписаться — /unsubscribe. Статистика — /status.');
+    await sendMessage(
+      chatId,
+      'Привет! Я бот "Назарей". Используй кнопки ниже, чтобы отметиться:\n' +
+          '— читал\n— молился\n— читал и молился\n\n' +
+          'Чтобы получать утренние напоминания в 6:00, используй /subscribe. ' +
+          'Чтобы отписаться — /unsubscribe. Статистика — /status.\n' +
+          'Если пропали кнопки, введи /menu или слово «кнопки».',
+      replyMarkup: buildMainKeyboard(),
+    );
     return;
   }
 
@@ -109,6 +115,12 @@ Future<void> handleMessage(Database db, int chatId, String username, String text
   if (text == '/unsubscribe') {
     setSubscribed(db, chatId, false);
     await sendMessage(chatId, 'Вы отписаны от утренних напоминаний.');
+    return;
+  }
+
+  // показать клавиатуру по запросу
+  if (text == '/menu' || text == 'кнопки' || text == 'кнопка' || text == 'меню') {
+    await sendMessage(chatId, 'Выберите действие:', replyMarkup: buildMainKeyboard());
     return;
   }
 
@@ -179,14 +191,15 @@ Future<void> handleMessage(Database db, int chatId, String username, String text
   if (text == '/status') {
     // Только личный статус (для всех)
     final today = todayString();
-    final rows = db.select('SELECT last_read_date, read_count, last_pray_date FROM users WHERE chat_id = ?;', [chatId]);
+    final rows = db.select('SELECT last_read_date, last_pray_date FROM users WHERE chat_id = ?;', [chatId]);
     if (rows.isNotEmpty) {
       final lastRead = rows.first['last_read_date'] as String? ?? 'не было';
-      final readCnt = (rows.first['read_count'] as int?) ?? 0;
       final lastPray = rows.first['last_pray_date'] as String? ?? 'не было';
       final readToday = lastRead == today ? '✅' : '❌';
       final prayToday = lastPray == today ? '✅' : '❌';
-      await sendMessage(chatId, 'Ваш статус на сегодня:\nЧтение: $readToday\nМолитва: $prayToday\nдень ' + readCnt.toString());
+      final dayRow = db.select('SELECT COUNT(*) AS cnt FROM daily_stats WHERE chat_id = ? AND did_read = 1;', [chatId]);
+      final dayNum = dayRow.isNotEmpty ? ((dayRow.first['cnt'] as int?) ?? 0) : 0;
+      await sendMessage(chatId, 'Ваш статус на сегодня:\nЧтение: ' + readToday + '\nМолитва: ' + prayToday + '\nдень ' + dayNum.toString());
     } else {
       await sendMessage(chatId, 'Пользователь не найден.');
     }
@@ -329,13 +342,15 @@ Future<void> handleMessage(Database db, int chatId, String username, String text
 
   // команда /user удалена
 
-  final readOnly = <String>{'прочитал', 'я прочитал'};
+  final readOnly = <String>{'прочитал', 'я прочитал', 'читал', 'я читал'};
   final prayOnly = <String>{'молился', 'я молился', 'помолился', 'я помолился'};
   final both = <String>{
     'прочитал и молился',
     'прочитал и помолился',
     'молился и прочитал',
-    'помолился и прочитал'
+    'помолился и прочитал',
+    'читал и молился',
+    'молился и читал'
   };
 
   if (readOnly.contains(text)) {
@@ -414,7 +429,7 @@ Future<void> handleMessage(Database db, int chatId, String username, String text
   }
 
 
-  await sendMessage(chatId, 'Я распознаю: "прочитал", "молился", фразы с этими словами, а также /subscribe, /unsubscribe, /status.');
+  await sendMessage(chatId, 'Используйте кнопки: "читал", "молился", "читал и молился". \nТакже распознаю фразы с этими словами и команды /subscribe, /unsubscribe, /status, /menu.');
 }
 
 bool isAdmin(Database db, int chatId) {
@@ -529,12 +544,16 @@ void setSubscribed(Database db, int chatId, bool sub) {
   db.execute('UPDATE users SET subscribed = ? WHERE chat_id = ?;', [sub ? 1 : 0, chatId]);
 }
 
-Future<void> sendMessage(int chatId, String text) async {
-  final uri = Uri.parse('${apiUrl}sendMessage').replace(queryParameters: {
+Future<void> sendMessage(int chatId, String text, {Map<String, dynamic>? replyMarkup}) async {
+  final params = <String, String>{
     'chat_id': chatId.toString(),
     'text': text,
-    'parse_mode': 'HTML'
-  });
+    'parse_mode': 'HTML',
+  };
+  if (replyMarkup != null) {
+    params['reply_markup'] = jsonEncode(replyMarkup);
+  }
+  final uri = Uri.parse('${apiUrl}sendMessage').replace(queryParameters: params);
   try {
     final resp = await http.get(uri);
     if (resp.statusCode != 200) {
@@ -543,6 +562,22 @@ Future<void> sendMessage(int chatId, String text) async {
   } catch (e) {
     print('Ошибка sendMessage: $e');
   }
+}
+
+Map<String, dynamic> buildMainKeyboard() {
+  return {
+    'keyboard': [
+      [
+        {'text': 'читал'},
+        {'text': 'молился'},
+      ],
+      [
+        {'text': 'читал и молился'},
+      ],
+    ],
+    'resize_keyboard': true,
+    'one_time_keyboard': false,
+  };
 }
 
 Future<void> scheduleDailyReminder(Database db) async {
@@ -563,7 +598,11 @@ Future<void> scheduleDailyReminder(Database db) async {
       } else {
         for (final row in rows) {
           final chatId = row['chat_id'] as int;
-          await sendMessage(chatId, 'Напоминание: доброе утро! Не забудьте сегодня прочитать Библию и помолиться. Отметьтесь сообщением "прочитал" или "молился".');
+          await sendMessage(
+            chatId,
+            'Напоминание: доброе утро! Не забудьте сегодня прочитать Библию и помолиться. Отметьтесь кнопками ниже.',
+            replyMarkup: buildMainKeyboard(),
+          );
           await Future.delayed(Duration(milliseconds: 200));
         }
         print('Напоминания отправлены: ${rows.length}');
