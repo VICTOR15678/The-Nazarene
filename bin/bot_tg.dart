@@ -4,11 +4,15 @@ import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:sqlite3/sqlite3.dart';
 
-const token = '7532281521:AAE3XEcfVB8ej_JeXpT3NsoLQ-SUSZmx_UM';
+final String token = Platform.environment['BOT_TOKEN'] ?? '';
 final apiUrl = 'https://api.telegram.org/bot$token/';
 final int superAdminId = int.tryParse(Platform.environment['SUPER_ADMIN_ID'] ?? '') ?? 0;
 
 void main() async {
+  if (token.isEmpty) {
+    stderr.writeln('Environment variable BOT_TOKEN is not set. Please set BOT_TOKEN and restart.');
+    exit(1);
+  }
   final db = initDb('nazorey.db');
 
   scheduleDailyReminder(db);
@@ -59,14 +63,17 @@ void _ensureSchema(Database db) {
 
 Future<void> pollUpdates(Database db) async {
   int offset = 0;
+  print('Начинаем опрос обновлений...');
   while (true) {
     final url = Uri.parse('${apiUrl}getUpdates?offset=$offset&timeout=20');
     try {
+      print('Запрашиваем обновления с offset=$offset');
       final resp = await http.get(url).timeout(Duration(seconds: 30));
       if (resp.statusCode == 200) {
         final data = jsonDecode(resp.body);
         if (data['ok'] == true) {
           final updates = data['result'] as List<dynamic>;
+          print('Получено ${updates.length} обновлений');
           for (var update in updates) {
             offset = update['update_id'] + 1;
             final message = update['message'];
@@ -77,9 +84,13 @@ Future<void> pollUpdates(Database db) async {
                 : (message['from'] != null ? (message['from']['first_name'] ?? '') : '');
             final textRaw = message['text'] ?? '';
             final text = textRaw.toString().trim().toLowerCase();
+            
+            print('Обрабатываем сообщение от $chatId ($username): "$text"');
 
             await handleMessage(db, chatId, username, text);
           }
+        } else {
+          print('getUpdates вернул ok=false: ${resp.body}');
         }
       } else {
         print('getUpdates error: ${resp.statusCode} ${resp.body}');
@@ -101,7 +112,7 @@ Future<void> handleMessage(Database db, int chatId, String username, String text
           '— читал\n— молился\n— читал и молился\n\n' +
           'Чтобы получать утренние напоминания в 6:00, используй /subscribe. ' +
           'Чтобы отписаться — /unsubscribe. Статистика — /status.\n' +
-          'Если пропали кнопки, введи /menu или слово «кнопки».',
+          'Все команды — /help. Если пропали кнопки, введи /menu или слово «кнопки».',
       replyMarkup: buildMainKeyboard(),
     );
     return;
@@ -121,6 +132,16 @@ Future<void> handleMessage(Database db, int chatId, String username, String text
   // показать клавиатуру по запросу
   if (text == '/menu' || text == 'кнопки' || text == 'кнопка' || text == 'меню') {
     await sendMessage(chatId, 'Выберите действие:', replyMarkup: buildMainKeyboard());
+    return;
+  }
+
+  // /help | /commands | "команды" — показать все команды
+  if (text == '/help' || text == '/commands' || text == 'команды') {
+    print('Обработка команды /help для пользователя $chatId');
+    final help = buildHelpMessage(db, chatId);
+    print('Справка сгенерирована, отправляем сообщение');
+    await sendMessage(chatId, help, replyMarkup: buildMainKeyboard());
+    print('Сообщение отправлено');
     return;
   }
 
@@ -188,155 +209,74 @@ Future<void> handleMessage(Database db, int chatId, String username, String text
     return;
   }
 
+  // /kick <id|@username> — кикнуть пользователя (для админов)
+  if (text.startsWith('/kick')) {
+    if (!isAdmin(db, chatId)) {
+      await sendMessage(chatId, 'Недостаточно прав.');
+      return;
+    }
+    final parts = text.split(RegExp('\\s+'));
+    if (parts.length < 2) {
+      await sendMessage(chatId, 'Использование: /kick <chat_id|@username>');
+      return;
+    }
+    final target = parts[1];
+    final targetId = parseTargetChatId(db, target);
+    if (targetId == null) {
+      await sendMessage(chatId, 'Пользователь не найден.');
+      return;
+    }
+    if (isSuperAdmin(targetId)) {
+      await sendMessage(chatId, 'Нельзя кикнуть супер-админа.');
+      return;
+    }
+    db.execute('DELETE FROM users WHERE chat_id = ?;', [targetId]);
+    db.execute('DELETE FROM daily_stats WHERE chat_id = ?;', [targetId]);
+    await sendMessage(chatId, 'Пользователь $target удалён из бота.');
+    return;
+  }
+
+  // /reset — полный сброс бота (только для супер-админа)
+  if (text == '/reset') {
+    if (!isSuperAdmin(chatId)) {
+      await sendMessage(chatId, 'Команда доступна только супер-админу.');
+      return;
+    }
+    db.execute('DELETE FROM users;');
+    db.execute('DELETE FROM daily_stats;');
+    await sendMessage(chatId, 'Бот полностью сброшен. Все данные удалены.');
+    return;
+  }
+
   if (text == '/status') {
     // Только личный статус (для всех)
     final today = todayString();
-    final rows = db.select('SELECT last_read_date, last_pray_date FROM users WHERE chat_id = ?;', [chatId]);
+    final rows = db.select('SELECT last_read_date, last_pray_date, subscribed FROM users WHERE chat_id = ?;', [chatId]);
     if (rows.isNotEmpty) {
       final lastRead = rows.first['last_read_date'] as String? ?? 'не было';
       final lastPray = rows.first['last_pray_date'] as String? ?? 'не было';
+      final subscribed = (rows.first['subscribed'] as int?) ?? 0;
       final readToday = lastRead == today ? '✅' : '❌';
       final prayToday = lastPray == today ? '✅' : '❌';
+      final subMark = subscribed == 1 ? '✅' : '❌';
       final dayRow = db.select('SELECT COUNT(*) AS cnt FROM daily_stats WHERE chat_id = ? AND did_read = 1;', [chatId]);
       final dayNum = dayRow.isNotEmpty ? ((dayRow.first['cnt'] as int?) ?? 0) : 0;
-      await sendMessage(chatId, 'Ваш статус на сегодня:\nЧтение: ' + readToday + '\nМолитва: ' + prayToday + '\nдень ' + dayNum.toString());
+      await sendMessage(chatId, 'Ваш статус на сегодня:\nПодписка: ' + subMark + '\nЧтение: ' + readToday + '\nМолитва: ' + prayToday + '\nдень ' + dayNum.toString());
     } else {
       await sendMessage(chatId, 'Пользователь не найден.');
     }
     return;
   }
 
-  // /report today | /report YYYY-MM-DD
-  if (text.startsWith('/report')) {
+  // /report — отчёт за сегодня (для админа)
+  if (text == '/report') {
     if (!isAdmin(db, chatId)) {
       await sendMessage(chatId, 'Недостаточно прав.');
       return;
     }
-    final parts = text.split(RegExp('\\s+'));
-    String date;
-    if (parts.length == 1 || parts[1] == 'today') {
-      date = todayString();
-    } else {
-      date = parts[1];
-    }
+    final date = todayString();
     final report = buildDailyReport(db, date);
     await sendMessage(chatId, report);
-    return;
-  }
-
-  // /report_all [@username|chat_id] — отчёт за все дни (для админа)
-  if (text.startsWith('/report_all')) {
-    if (!isAdmin(db, chatId)) {
-      await sendMessage(chatId, 'Недостаточно прав.');
-      return;
-    }
-    final parts = text.split(RegExp('\\s+'));
-    int? targetId;
-    if (parts.length >= 2) {
-      targetId = parseTargetChatId(db, parts[1]);
-      if (targetId == null) {
-        await sendMessage(chatId, 'Пользователь не найден.');
-        return;
-      }
-    }
-
-    // Определяем диапазон дат: от минимальной даты в daily_stats до сегодняшней
-    final minRow = db.select('SELECT MIN(date) AS min_date FROM daily_stats' + (targetId != null ? ' WHERE chat_id = ?' : '') + ';', targetId != null ? [targetId] : const []);
-    if (minRow.isEmpty || minRow.first['min_date'] == null) {
-      await sendMessage(chatId, targetId != null ? 'Нет данных по этому пользователю.' : 'Нет данных.');
-      return;
-    }
-    final minDateStr = minRow.first['min_date'] as String;
-    DateTime startDate;
-    try {
-      startDate = DateTime.parse(minDateStr);
-    } catch (_) {
-      await sendMessage(chatId, 'Ошибка формата даты в БД.');
-      return;
-    }
-    final now = DateTime.now();
-    final endDate = DateTime(now.year, now.month, now.day);
-
-    // Собираем отчёты по каждой дате и отправляем чанками
-    final List<String> chunks = [];
-    StringBuffer current = StringBuffer();
-    for (DateTime d = startDate; !d.isAfter(endDate); d = d.add(Duration(days: 1))) {
-      final y = d.year.toString().padLeft(4, '0');
-      final m = d.month.toString().padLeft(2, '0');
-      final day = d.day.toString().padLeft(2, '0');
-      final date = y + '-' + m + '-' + day;
-      String report;
-      if (targetId != null) {
-        // Один пользователь на эту дату
-        final row = db.select(
-          'SELECT u.chat_id, u.username, u.subscribed, COALESCE(ds.did_read,0) AS did_read, COALESCE(ds.did_pray,0) AS did_pray '
-          'FROM users u LEFT JOIN daily_stats ds ON ds.chat_id = u.chat_id AND ds.date = ? '
-          'WHERE u.chat_id = ? LIMIT 1;',
-          [date, targetId],
-        );
-        if (row.isEmpty) continue;
-        final uname = (row.first['username'] as String?) ?? '';
-        final id = row.first['chat_id'];
-        final subscribed = (row.first['subscribed'] as int?) ?? 0;
-        final subMark = subscribed == 1 ? '✅' : '❌';
-        final readMark = (row.first['did_read'] as int) == 1 ? '✅' : '❌';
-        final prayMark = (row.first['did_pray'] as int) == 1 ? '✅' : '❌';
-        final dayRow = db.select(
-          'SELECT COUNT(*) AS cnt FROM daily_stats WHERE chat_id = ? AND did_read = 1 AND date <= ?;',
-          [id, date],
-        );
-        final dayNum = dayRow.isNotEmpty ? ((dayRow.first['cnt'] as int?) ?? 0) : 0;
-        report = 'Отчёт за ' + date + ':\n\n' + 'день ' + dayNum.toString() + '\n' + 'подписка: ' + subMark + '\n' + (uname.isNotEmpty ? '@' + uname : id.toString()) + ' — чтение: ' + readMark + ', молитва: ' + prayMark + ';\n';
-      } else {
-        // Все подписанные пользователи на эту дату
-        // Используем buildDailyReport и добавим подписку в метку прямо здесь
-        final rows2 = db.select(
-          'SELECT u.chat_id, u.username, u.subscribed, COALESCE(ds.did_read,0) AS did_read, COALESCE(ds.did_pray,0) AS did_pray '
-          'FROM users u '
-          'LEFT JOIN daily_stats ds ON ds.chat_id = u.chat_id AND ds.date = ? '
-          'WHERE u.subscribed = 1 OR u.subscribed = 0 '
-          'ORDER BY LOWER(COALESCE(u.username, "")) ASC, u.chat_id ASC;',
-          [date],
-        );
-        if (rows2.isEmpty) {
-          report = 'Нет данных за ' + date + '.';
-        } else {
-          final b = StringBuffer('Отчёт за ' + date + ':\n\n');
-          for (final r2 in rows2) {
-            final uname2 = (r2['username'] as String?) ?? '';
-            final id2 = r2['chat_id'];
-            final subscribed2 = (r2['subscribed'] as int?) ?? 0;
-            final subMark2 = subscribed2 == 1 ? '✅' : '❌';
-            final readMark2 = (r2['did_read'] as int) == 1 ? '✅' : '❌';
-            final prayMark2 = (r2['did_pray'] as int) == 1 ? '✅' : '❌';
-            final dayRow2 = db.select(
-              'SELECT COUNT(*) AS cnt FROM daily_stats WHERE chat_id = ? AND did_read = 1 AND date <= ?;',
-              [id2, date],
-            );
-            final dayNum2 = dayRow2.isNotEmpty ? ((dayRow2.first['cnt'] as int?) ?? 0) : 0;
-            b.writeln('день ' + dayNum2.toString());
-            b.writeln('подписка: ' + subMark2);
-            b.writeln((uname2.isNotEmpty ? '@' + uname2 : id2.toString()) + ' — чтение: ' + readMark2 + ', молитва: ' + prayMark2 + ';');
-            b.writeln('');
-          }
-          report = b.toString();
-        }
-      }
-
-      if (current.length + report.length > 3500) {
-        chunks.add(current.toString());
-        current = StringBuffer();
-      }
-      current.write(report + '\n');
-    }
-    if (current.isNotEmpty) {
-      chunks.add(current.toString());
-    }
-
-    for (final chunk in chunks) {
-      await sendMessage(chatId, chunk.trim());
-      await Future.delayed(Duration(milliseconds: 300));
-    }
     return;
   }
 
@@ -486,6 +426,35 @@ String buildDailyReport(Database db, String date) {
   return buffer.toString();
 }
 
+String buildHelpMessage(Database db, int chatId) {
+  final isAdminUser = isAdmin(db, chatId);
+  final isSuper = isSuperAdmin(chatId);
+  final b = StringBuffer();
+  b.writeln('Доступные команды:');
+  b.writeln('');
+  b.writeln('/start — запуск бота и показ ');
+  b.writeln('/menu — показать кнопки');
+  b.writeln('/status — ваш статус на сегодня и текущий день');
+  b.writeln('/subscribe — включить утренние напоминания (06:00)');
+  b.writeln('/unsubscribe — выключить напоминания');
+  b.writeln('');
+  if (isAdminUser) {
+    b.writeln('Команды для админов:');
+    b.writeln('/report — отчёт за сегодня');
+    b.writeln('/admins — список администраторов');
+    b.writeln('/kick <chat_id|@username> — удалить пользователя из бота');
+    b.writeln('');
+  }
+  if (isSuper) {
+    b.writeln('Команды для супер-админа:');
+    b.writeln('/admin_add <chat_id|@username> — выдать права админа');
+    b.writeln('/admin_remove <chat_id|@username> — снять права админа');
+    b.writeln('/reset — полный сброс бота (удалить всех пользователей и данные)');
+    b.writeln('');
+  }
+  return b.toString();
+}
+
 void registerUserIfNeeded(Database db, int chatId, String username) {
   final rows = db.select('SELECT 1 FROM users WHERE chat_id = ?;', [chatId]);
   if (rows.isEmpty) {
@@ -545,22 +514,57 @@ void setSubscribed(Database db, int chatId, bool sub) {
 }
 
 Future<void> sendMessage(int chatId, String text, {Map<String, dynamic>? replyMarkup}) async {
+  print('Отправляем сообщение в чат $chatId: "${text.substring(0, text.length > 50 ? 50 : text.length)}..."');
   final params = <String, String>{
     'chat_id': chatId.toString(),
     'text': text,
-    'parse_mode': 'HTML',
   };
   if (replyMarkup != null) {
     params['reply_markup'] = jsonEncode(replyMarkup);
   }
-  final uri = Uri.parse('${apiUrl}sendMessage').replace(queryParameters: params);
-  try {
-    final resp = await http.get(uri);
-    if (resp.statusCode != 200) {
+  final uri = Uri.parse('${apiUrl}sendMessage');
+  int attempt = 0;
+  while (true) {
+    try {
+      print('Попытка отправки #${attempt + 1}');
+      final resp = await http.post(uri, body: params);
+      if (resp.statusCode == 200) {
+        print('Сообщение успешно отправлено');
+        break;
+      }
+      if (resp.statusCode == 429) {
+        int retryAfterSec = 1;
+        try {
+          final body = jsonDecode(resp.body);
+          final paramsObj = body is Map ? body['parameters'] : null;
+          if (paramsObj is Map && paramsObj['retry_after'] is int) {
+            retryAfterSec = paramsObj['retry_after'] as int;
+          }
+        } catch (_) {}
+        print('Rate limit, ждём $retryAfterSec секунд');
+        await Future.delayed(Duration(seconds: retryAfterSec));
+        attempt++;
+        if (attempt < 3) {
+          continue;
+        }
+      } else if (resp.statusCode >= 500 && resp.statusCode < 600) {
+        print('Серверная ошибка ${resp.statusCode}, повторяем');
+        await Future.delayed(Duration(milliseconds: 300 * (attempt + 1)));
+        attempt++;
+        if (attempt < 3) {
+          continue;
+        }
+      }
       print('Ошибка sendMessage ${resp.statusCode}: ${resp.body}');
+      break;
+    } catch (e) {
+      print('Ошибка sendMessage: $e');
+      await Future.delayed(Duration(milliseconds: 300 * (attempt + 1)));
+      attempt++;
+      if (attempt >= 3) {
+        break;
+      }
     }
-  } catch (e) {
-    print('Ошибка sendMessage: $e');
   }
 }
 
@@ -603,7 +607,7 @@ Future<void> scheduleDailyReminder(Database db) async {
             'Напоминание: доброе утро! Не забудьте сегодня прочитать Библию и помолиться. Отметьтесь кнопками ниже.',
             replyMarkup: buildMainKeyboard(),
           );
-          await Future.delayed(Duration(milliseconds: 200));
+              await Future.delayed(Duration(milliseconds: 200));
         }
         print('Напоминания отправлены: ${rows.length}');
       }
